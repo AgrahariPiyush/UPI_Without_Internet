@@ -1,0 +1,148 @@
+Real Time UPI vs Project
+
+Cocnepts of Project : simulator of distributed system
+
+1)Asynchbrus Communication through sttranger nodes : Bluetooth using Hybrid encryption (RSA-OAEP + AES-GCM)
+2)Solving Duplicate Concurrncy problm : using idempotency
+3)Replay Attaks : using TTL
+
+
+Drawbacks
+
+1)Choosing the right TTL here is a real product and regulatory constraint, not just a code constant.
+
+2) No regulatory compliance layer : Real UPI: Every transaction goes through NPCI's switch, is logged in a regulated ledger, is subject to RBI guidelines on transaction limits (UPI Lite is capped at ₹500 per transaction, ₹2000 total wallet balance),
+ and every bridge node equivalent is a licensed Payment Service Provider.
+
+3)H2 in-memory database means zero durability :
+-Real payment system: PostgreSQL with synchronous replication — a transaction is only confirmed after it's written to at least one replica.
+The ledger survives server crashes.
+- H2 in-memory means the entire ledger disappears on server restart. If the Spring Boot process crashes mid-settlement (after debit, before ledger write), the data is gone. @Transactional handles application-level
+ atomicity but can't protect against process death if the DB itself is volatile.
+
+4)Bluetooth is hard to practice : Transport layer problem
+-real Bluetooth Low Energy (BLE) on Android has been heavily throttled after android 8.
+-background BLE scanning is rate-limited, apps can't maintain GATT connections while backgrounded, and iOS peripheral mode is locked down almost entirely for third-party apps.
+-So we directly use simulating all five "phones" as in-memory objects on one JVM.
+
+5)Single JVM idempotency check :
+-If we have 2 instances of Spring boot then request would be passed by bpoth if routed to both.
+-So we will use Redis which will have replicas across distributed instances.
+
+
+6)No pin verification :
+-PaymentInstruction contains a pinHash field — presumably a hash of the PIN.
+
+7)Security Issue : Stranger carries encrpted data
+
+8)he receiver has no way to verify the sender has the funds : it is just LOI
+
+In real systems
+-auth,compliance layer , pin verification , direct internet connect b/w banker and user
+-complaince layer , real database system , idempotency with redis
+-rate limiting , logs generation
+
+Flow
+
+Step 1: sender creates packet : PaymentInstruction + nonce + signedAt
+Step 2: hybrid encrypt : RSA-OAEP + AES-256-GCM → ciphertext
+Step 3: BLE mesh gossip : packet hops phone-to-phone, TTL
+Step 4: bridge gets internet : POST /api/bridge/ingest (minutes later)
+Step 5: SHA-256 dedup : ConcurrentHashMap.putIfAbsent(hash)
+Step 6: server decrypt : RSA unwrap → AES-GCM → PaymentInstruction
+Step 6: server decrypt : RSA unwrap → AES-GCM → PaymentInstruction
+Step 7: freshness check : signedAt within 24h — else INVALID
+Step 8: @Transactional settle : debit sender + credit receiver + ledge
+Step 9 : return output : settled,duplicate,invalid
+
+Invariants
+
+1)RSA can only encrypt ~245 bytes for a 2048-bit key. A PaymentInstruction JSON is ~300 bytes.
+RSA is also slow.AES-GCM is ~100x faster and handles unlimited data. So RSA is used only to encrypt the 32-byte AES key (key wrapping), and AES does the actual payload.
+
+2)Use of IV and should be unique per packet :
+
+3)Hash Idempotency insread of pakedID
+-The ciphertext is cryptographically authenticated by GCM, so any modification is detectable.
+-Two legitimate deliveries of the same payment are byte-for-byte identical →
+same SHA-256 hash → idempotency cache catches the duplicate.
+
+
+4)RSA vs GCM
+-RSA provides confidentiality of the AES key — only the server can unwrap it.
+-GCM provides both confidentiality (encryption) AND integrity (authentication tag) of the payload.
+
+
+Hashing Concepts
+
+1.SecureRandom:
+-used for generating randdom number which are hard to predict unlinke
+Math.RAndom() : pulls entropy from the OS (hardware noise, timing jitter, etc.) making its output genuinely unpredictable.
+-Use :SecureRandom generates the 12-byte IV (initialization vector) for AES-GCM. Every packet gets a different IV,
+so even if you encrypt the same PaymentInstruction twice, the ciphertext looks completely different each time — preventing pattern analysis.
+-rng.nextBytes(iv); // OS entropy → 12 random bytes, different every call
+
+2.ObjectMapper : converts Java objects ↔ JSON bytes using reflection on field names and types.
+Use : to convert into bytes
+
+3.Cipher.init() + aes.doFinal() : It does two things in one algorithm: encrypts the data AND produces a 16-byte authentication tag that acts as a tamper-proof seal.
+-doFinal() checkes tamloering return invalid if tampered or return value pn decrption
+ie.byte[] plaintext = aes.doFinal(aesCiphertext);
+-GCMParameterSpec bundles the two parameters GCM needs: tag length (128 bits = 16 bytes) and the IV.
+ie.aes.init(Cipher.ENCRYPT_MODE, aesKey, new GCMParameterSpec(GCM_TAG_BITS, iv))
+
+
+4.Byte Buffer : NIO's structured byte array wrapper
+-ByteBuffer buf = ByteBuffer.allocate(encryptedAesKey.length + iv.length + aesCiphertext.length);
+-buf.put(encryptedAesKey); // cursor: 0   → 256
+ buf.put(iv);              // cursor: 256 → 268
+ buf.put(aesCiphertext);
+-allocate : () to build warpper  , wrap() : to use pre-exisiitng buffer , get() : to read data
+
+
+5.Base64.getEncoder().encodeToString() : to aovid corruption of json feilds
+-Base64 encodes arbitrary binary bytes into a string using only 64 printable ASCII characters (A–Z, a–z, 0–9, +, /).
+Every 3 bytes of binary becomes 4 characters of text, so the output is ~33% larger.
+
+6.Create threads in test class
+-To create thread : ExecutorService pool = Executors.newFixedThreadPool(3);
+-To start threads at same time :  CountDownLatch start = new CountDownLatch(1);
+-Count successfull execution/duplicates :  AtomicInteger settled = new AtomicInteger();
+
+
+
+
+Bridge Indigestion Service : would be done under try-catch block , log would be maintained
+
+Flow :
+Hash Cipher Text
+Idompotency check : chech hash in cache , if already there drop it
+Decrypt : using server private key , if fails reject it
+Freshness Check : reject if signedAt is too old : long ageSeconds = (Instant.now().toEpochMilli() - instruction.getSignedAt()) / 1000;
+Settle : update in db
+helper functions : settled,duplicate,invalid (String outcome, String packetHash, String reason, Long transactionId)
+
+Idempotency Snippet
+
+    public boolean claim(String packetHash) {
+        Instant now = Instant.now();
+        Instant prev = seen.putIfAbsent(packetHash, now);
+        return prev == null;
+    }
+
+
+Mesh Simulator Service
+-propogation cycle of mesh netwrok
+-snapshot is takne to ensure one hop is done with ttl decemented
+-returns updates netwroks states after hopping
+
+
+Idempotency Concurrency Test
+-Multiple Nodes have same packet and sending to server at same time to create race condition
+
+
+
+
+
+
+
